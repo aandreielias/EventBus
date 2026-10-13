@@ -20,15 +20,18 @@ public final class ChannelInfo {
     private Instant lastFiredAt;
     private final AtomicLong publicationCount = new AtomicLong(0);
 
+    /** Starts tracking {@code channel}, stamping the current time as its creation time. */
     public ChannelInfo(Channel channel) {
         this.channel = Objects.requireNonNull(channel, "Channel must not be null.");
         this.createdAt = Instant.now();
     }
 
+    /** The channel these statistics belong to. */
     public Channel getChannel() {
         return channel;
     }
 
+    /** When the channel was first registered. */
     public Instant getCreatedAt() {
         return createdAt;
     }
@@ -38,6 +41,7 @@ public final class ChannelInfo {
         return lastFiredAt;
     }
 
+    /** Total publications recorded on this channel. */
     public long getPublicationCount() {
         return publicationCount.get();
     }

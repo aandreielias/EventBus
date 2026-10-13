@@ -11,6 +11,12 @@ import ae.eventbus.core.subscription.Subscriber;
 public interface EventDispatcher extends AutoCloseable {
 
     /**
+     * Default upper bound on concurrently running asynchronous subscriber invocations
+     * for the built-in dispatchers. Invocations beyond the bound run on the publishing thread.
+     */
+    int DEFAULT_MAX_CONCURRENT_ASYNC_TASKS = 10_000;
+
+    /**
      * Dispatches an event to the provided list of subscribers.
      *
      * @param event       the event to dispatch

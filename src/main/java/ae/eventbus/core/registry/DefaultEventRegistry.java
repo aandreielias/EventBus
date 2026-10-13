@@ -9,6 +9,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import ae.eventbus.core.channel.Channel;
 import ae.eventbus.core.event.Event;
@@ -37,6 +38,7 @@ public final class DefaultEventRegistry implements EventRegistry {
     private final ConcurrentHashMap<Channel, ChannelInfo> channelInfoMap = new ConcurrentHashMap<>();
     private final ConcurrentLinkedQueue<EventRecord> history = new ConcurrentLinkedQueue<>();
     private final AtomicInteger historySize = new AtomicInteger(0);
+    private final AtomicLong sequence = new AtomicLong(0);
 
     public DefaultEventRegistry(EventRouter router, int maxHistorySize, int maxChannels) {
         this.router = Objects.requireNonNull(router, "EventRouter must not be null.");
@@ -71,7 +73,7 @@ public final class DefaultEventRegistry implements EventRegistry {
             channelInfoMap.computeIfAbsent(channel, ChannelInfo::new).recordFired();
         }
 
-        history.offer(new EventRecord(event, channel, recipientCount));
+        history.offer(new EventRecord(sequence.incrementAndGet(), event, channel, recipientCount));
         if (historySize.incrementAndGet() > maxHistorySize) {
             if (history.poll() != null) {
                 historySize.decrementAndGet();
@@ -141,7 +143,9 @@ public final class DefaultEventRegistry implements EventRegistry {
                 sub.isHandlesChannelChildren(),
                 sub.isValid(),
                 sub.getSubscribedAt(),
-                sub.getUnsubscribedAt()
+                sub.getUnsubscribedAt(),
+                sub.getDeliveredCount(),
+                sub.getFailedCount()
         );
     }
 }

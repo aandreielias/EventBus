@@ -6,11 +6,14 @@ import ae.eventbus.core.event.Event;
 import java.util.regex.Pattern;
 
 /**
- * Default structural validator enforcing security constraints, maximum hierarchy depths,
- * and valid channel naming standards.
- * Payload is not allowed null.
- * Max Channel depth is 10
- * Only Limited Characters allowed in Channel name 
+ * Default structural validator enforcing channel naming and depth constraints.
+ *
+ * <ul>
+ *   <li>Payloads must not be {@code null}.</li>
+ *   <li>Channel depth is limited to {@value #DEFAULT_MAX_CHANNEL_DEPTH} segments unless configured otherwise.</li>
+ *   <li>Segments may only contain {@code [a-zA-Z0-9_.-]} and never the bus's channel separator,
+ *       so every channel round-trips through its string path.</li>
+ * </ul>
  */
 public final class DefaultEventValidator implements EventValidator {
 
@@ -18,14 +21,29 @@ public final class DefaultEventValidator implements EventValidator {
     private static final Pattern VALID_SEGMENT_PATTERN = Pattern.compile("^[a-zA-Z0-9_\\-\\.]+$");
 
     private final int maxChannelDepth;
+    private final String channelSeparator;
 
-    public DefaultEventValidator(int maxChannelDepth) {
+    /**
+     * @param maxChannelDepth  maximum number of segments
+     * @param channelSeparator separator segments must not contain
+     */
+    public DefaultEventValidator(int maxChannelDepth, String channelSeparator) {
         if (maxChannelDepth <= 0) {
             throw new IllegalArgumentException("Max channel depth must be greater than zero.");
         }
+        if (channelSeparator == null || channelSeparator.isEmpty()) {
+            throw new IllegalArgumentException("Channel separator must neither be null nor empty.");
+        }
         this.maxChannelDepth = maxChannelDepth;
+        this.channelSeparator = channelSeparator;
     }
 
+    /** Validator for the default separator {@code "/"}. */
+    public DefaultEventValidator(int maxChannelDepth) {
+        this(maxChannelDepth, Channel.DEFAULT_SEPARATOR);
+    }
+
+    /** Validator with the default depth and separator. */
     public DefaultEventValidator() {
         this(DEFAULT_MAX_CHANNEL_DEPTH);
     }
@@ -42,10 +60,10 @@ public final class DefaultEventValidator implements EventValidator {
             ));
         }
         for (String segment : channel.getSegments()) {
-            if (!VALID_SEGMENT_PATTERN.matcher(segment).matches()) {
+            if (!VALID_SEGMENT_PATTERN.matcher(segment).matches() || segment.contains(channelSeparator)) {
                 throw new ValidationException(String.format(
-                        "Channel segment '%s' in channel '%s' contains illegal characters. Only alphanumeric, dashes, dots, and underscores are allowed.",
-                        segment, channel
+                        "Channel segment '%s' in channel '%s' contains illegal characters. Only alphanumeric, dashes, dots, and underscores are allowed, and never the separator '%s'.",
+                        segment, channel, channelSeparator
                 ));
             }
         }

@@ -23,34 +23,56 @@ import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
+import java.util.function.Predicate;
 
+/**
+ * Default {@link EventBus} implementation: an orchestrator that delegates routing, dispatching,
+ * validation and bookkeeping to the strategies supplied by {@link EventBusBuilder}.
+ *
+ * <p>Live subscriptions are indexed by id and removed from the index as soon as they end
+ * (explicitly, through {@link #close()}, or because a weak target was collected), so
+ * subscribe/unsubscribe churn does not accumulate memory. Pending requests are tracked
+ * so that {@link #close()} can fail them instead of leaving callers waiting for a timeout.</p>
+ */
 public final class DefaultEventBus implements EventBus {
+
+    private static final System.Logger LOGGER = System.getLogger(DefaultEventBus.class.getName());
 
     private final EventRouter router;
     private final EventDispatcher dispatcher;
     private final EventRegistry registry;
     private final EventValidator validator;
     private final String channelSeparator;
-    private final ReferenceType defaultReferenceType;
     private final Duration defaultTimeout;
     private final EventHandler<Event> deadLetterHandler;
 
     private final AtomicBoolean closed = new AtomicBoolean(false);
-    private final CopyOnWriteArrayList<Subscription> activeSubscriptions = new CopyOnWriteArrayList<>();
+    private final ConcurrentHashMap<UUID, Subscription> subscriptions = new ConcurrentHashMap<>();
+    private final Set<RequestEnvelope<?, ?>> pendingRequests = ConcurrentHashMap.newKeySet();
 
+    /**
+     * @param router            resolves subscribers for a channel
+     * @param dispatcher        invokes resolved subscribers; closed together with the bus
+     * @param registry          records channels and publication history
+     * @param validator         validates channels, events and payloads
+     * @param channelSeparator  separator used to parse string channel paths
+     * @param defaultTimeout    timeout for requests that do not specify one
+     * @param deadLetterHandler receives events nobody subscribed to; may be {@code null}
+     */
     public DefaultEventBus(EventRouter router,
                            EventDispatcher dispatcher,
                            EventRegistry registry,
                            EventValidator validator,
                            String channelSeparator,
-                           ReferenceType defaultReferenceType,
                            Duration defaultTimeout,
                            EventHandler<Event> deadLetterHandler) {
         this.router = Objects.requireNonNull(router, "EventRouter must not be null.");
@@ -58,9 +80,8 @@ public final class DefaultEventBus implements EventBus {
         this.registry = Objects.requireNonNull(registry, "EventRegistry must not be null.");
         this.validator = Objects.requireNonNull(validator, "EventValidator must not be null.");
         this.channelSeparator = Objects.requireNonNull(channelSeparator, "ChannelSeparator must not be null.");
-        this.defaultReferenceType = Objects.requireNonNull(defaultReferenceType, "DefaultReferenceType must not be null.");
         this.defaultTimeout = Objects.requireNonNull(defaultTimeout, "DefaultTimeout must not be null.");
-        this.deadLetterHandler = deadLetterHandler; // nullable
+        this.deadLetterHandler = deadLetterHandler;
     }
 
     private void ensureNotClosed() {
@@ -73,6 +94,13 @@ public final class DefaultEventBus implements EventBus {
     public String getChannelSeparator() {
         return channelSeparator;
     }
+
+    @Override
+    public boolean isClosed() {
+        return closed.get();
+    }
+
+    // === PUBLISH ===
 
     @Override
     public void publish(Event event) {
@@ -95,8 +123,9 @@ public final class DefaultEventBus implements EventBus {
         } else if (deadLetterHandler != null) {
             try {
                 deadLetterHandler.handle(event);
-            } catch (Throwable ignored) {
+            } catch (Throwable t) {
                 // Dead-letter handler exceptions must never propagate to the publisher.
+                LOGGER.log(System.Logger.Level.WARNING, "Dead-letter handler failed for event " + event.getId(), t);
             }
         }
     }
@@ -110,33 +139,21 @@ public final class DefaultEventBus implements EventBus {
 
     @Override
     public <T> void publish(String channelPath, T payload) {
-        ensureNotClosed();
-        Channel channel = Channel.parse(channelPath, channelSeparator);
-        publish(channel, payload);
+        publish(Channel.parse(channelPath, channelSeparator), payload);
     }
+
+    // === SUBSCRIBE ===
 
     @Override
     public <T> Subscription subscribe(Channel channel, Class<T> eventType, EventHandler<T> handler) {
         return subscribe(channel, eventType, Priority.NORMAL, DispatchMode.SYNCHRONOUS,
-                defaultReferenceType, false, null, handler);
+                ReferenceType.STRONG, false, null, handler);
     }
 
     @Override
     public <T> Subscription subscribeToHierarchy(Channel channel, Class<T> eventType, EventHandler<T> handler) {
         return subscribe(channel, eventType, Priority.NORMAL, DispatchMode.SYNCHRONOUS,
-                defaultReferenceType, true, null, handler);
-    }
-
-    @Override
-    public <T> Subscription subscribe(Channel channel,
-                                      Class<T> eventType,
-                                      Priority priority,
-                                      DispatchMode dispatchMode,
-                                      ReferenceType referenceType,
-                                      boolean handlesChannelChildren,
-                                      EventHandler<T> handler) {
-        return subscribe(channel, eventType, priority, dispatchMode, referenceType,
-                handlesChannelChildren, null, handler);
+                ReferenceType.STRONG, true, null, handler);
     }
 
     @Override
@@ -151,28 +168,48 @@ public final class DefaultEventBus implements EventBus {
         ensureNotClosed();
         validator.validateChannel(channel);
         Objects.requireNonNull(eventType, "EventType cannot be null.");
-        Objects.requireNonNull(priority, "Priority cannot be null.");
-        Objects.requireNonNull(dispatchMode, "DispatchMode cannot be null.");
-        Objects.requireNonNull(referenceType, "ReferenceType cannot be null.");
         Objects.requireNonNull(handler, "Handler cannot be null.");
+        if (RequestEnvelope.class.isAssignableFrom(eventType)) {
+            throw new IllegalArgumentException("Requests can only be answered through handleRequest(...).");
+        }
 
-        registry.registerChannel(channel);
-
-        AtomicReference<Subscriber<T>> holderRef = new AtomicReference<>();
-        Subscriber<T> subscriber = new Subscriber<>(
+        return register(holder -> new Subscriber<>(
                 channel, eventType, priority, dispatchMode, referenceType,
-                handlesChannelChildren, handler, () -> router.deregister(holderRef.get()),
-                null, subscriberTarget
-        );
-        holderRef.set(subscriber);
-        router.register(subscriber);
-
-        Subscription sub = subscriber.getSubscription();
-        activeSubscriptions.add(sub);
-        return sub;
+                handlesChannelChildren, handler, holder, null, subscriberTarget));
     }
 
-    // === REQUEST-RESPONSE IMPLEMENTATION ===
+    @Override
+    public Optional<Subscription> getSubscription(UUID subscriptionId) {
+        return Optional.ofNullable(subscriptions.get(Objects.requireNonNull(subscriptionId, "Subscription id must not be null.")));
+    }
+
+    /**
+     * Creates, indexes and routes a subscriber. The factory receives the unsubscribe callback,
+     * which removes the subscriber from both the router and the subscription index.
+     */
+    private <T> Subscription register(Function<Runnable, Subscriber<T>> factory) {
+        AtomicReference<Subscriber<T>> holderRef = new AtomicReference<>();
+        Subscriber<T> subscriber = factory.apply(() -> {
+            Subscriber<T> self = holderRef.get();
+            router.deregister(self);
+            subscriptions.remove(self.getId());
+        });
+        holderRef.set(subscriber);
+
+        registry.registerChannel(subscriber.getChannel());
+        Subscription subscription = subscriber.getSubscription();
+        subscriptions.put(subscription.getId(), subscription);
+        router.register(subscriber);
+
+        // close() may have run between ensureNotClosed() and the put above; don't leak past it.
+        if (closed.get()) {
+            subscription.unsubscribe();
+            throw new IllegalStateException("EventBus has been closed.");
+        }
+        return subscription;
+    }
+
+    // === REQUEST-RESPONSE ===
 
     @Override
     @SuppressWarnings({"rawtypes", "unchecked"})
@@ -182,37 +219,19 @@ public final class DefaultEventBus implements EventBus {
         Objects.requireNonNull(requestType, "RequestType cannot be null.");
         validator.validateChannel(channel);
 
-        registry.registerChannel(channel);
+        EventHandler<RequestEnvelope> envelopeHandler = envelope -> {
+            try {
+                envelope.submitResponse(handler.handle(requestType.cast(envelope.getRequest())));
+            } catch (Throwable t) {
+                envelope.submitFailure(t);
+            }
+        };
+        Predicate<Event> acceptsRequestType =
+                event -> event instanceof RequestEnvelope<?, ?> req && requestType.isInstance(req.getRequest());
 
-        AtomicReference<Subscriber<RequestEnvelope>> holderRef = new AtomicReference<>();
-        Subscriber<RequestEnvelope> subscriber = new Subscriber<>(
-                channel,
-                RequestEnvelope.class,
-                Priority.NORMAL,
-                DispatchMode.SYNCHRONOUS,
-                defaultReferenceType,
-                false,
-                (EventHandler<RequestEnvelope>) envelope -> {
-                    if (requestType.isInstance(envelope.getRequest())) {
-                        try {
-                            REQ req = requestType.cast(envelope.getRequest());
-                            RES res = handler.handle(req);
-                            envelope.submitResponse(res);
-                        } catch (Throwable t) {
-                            envelope.submitFailure(t);
-                        }
-                    }
-                },
-                () -> router.deregister(holderRef.get()),
-                event -> (event instanceof RequestEnvelope<?, ?> req && requestType.isInstance(req.getRequest())),
-                null
-        );
-        holderRef.set(subscriber);
-        router.register(subscriber);
-
-        Subscription sub = subscriber.getSubscription();
-        activeSubscriptions.add(sub);
-        return sub;
+        return register(holder -> new Subscriber<>(
+                channel, RequestEnvelope.class, Priority.NORMAL, DispatchMode.ASYNCHRONOUS,
+                ReferenceType.STRONG, false, envelopeHandler, holder, acceptsRequestType, null));
     }
 
     @Override
@@ -231,39 +250,6 @@ public final class DefaultEventBus implements EventBus {
         return dispatchRequest(channel, request, responseType, subscriberId, timeout).getSingleFuture();
     }
 
-    private <REQ, RES> RequestEnvelope<REQ, RES> dispatchRequest(Channel channel, REQ request,
-                                                                  Class<RES> responseType,
-                                                                  UUID targetSubscriberId,
-                                                                  Duration timeout) {
-        ensureNotClosed();
-        validator.validatePayload(channel, request);
-        registry.registerChannel(channel);
-
-        RequestEnvelope<REQ, RES> envelope = new RequestEnvelope<>(request, channel, responseType, targetSubscriberId);
-
-        List<Subscriber<?>> matched = router.resolveSubscribers(envelope, channel);
-
-        if (targetSubscriberId != null) {
-            matched = matched.stream().filter(sub -> sub.getId().equals(targetSubscriberId)).toList();
-        }
-
-        if (matched.isEmpty()) {
-            NoResponderException ex = new NoResponderException(channel);
-            envelope.getSingleFuture().completeExceptionally(ex);
-            envelope.getAllFuture().completeExceptionally(ex);
-            return envelope;
-        }
-
-        envelope.setExpectedResponders(matched.size());
-        envelope.getSingleFuture().orTimeout(timeout.toMillis(), TimeUnit.MILLISECONDS);
-        envelope.getAllFuture().orTimeout(timeout.toMillis(), TimeUnit.MILLISECONDS);
-
-        registry.recordPublication(envelope, channel, matched.size());
-        dispatcher.dispatch(envelope, matched);
-
-        return envelope;
-    }
-
     @Override
     public <REQ, RES> CompletableFuture<RES> request(Channel channel, REQ request, Class<RES> responseType) {
         return request(channel, request, responseType, defaultTimeout);
@@ -279,6 +265,43 @@ public final class DefaultEventBus implements EventBus {
         return requestFrom(subscriberId, channel, request, responseType, defaultTimeout);
     }
 
+    private <REQ, RES> RequestEnvelope<REQ, RES> dispatchRequest(Channel channel, REQ request,
+                                                                  Class<RES> responseType,
+                                                                  UUID targetSubscriberId,
+                                                                  Duration timeout) {
+        ensureNotClosed();
+        Objects.requireNonNull(timeout, "Timeout must not be null.");
+        validator.validatePayload(channel, request);
+        registry.registerChannel(channel);
+
+        RequestEnvelope<REQ, RES> envelope = new RequestEnvelope<>(request, channel, responseType, targetSubscriberId);
+
+        List<Subscriber<?>> matched = router.resolveSubscribers(envelope, channel);
+        if (targetSubscriberId != null) {
+            matched = matched.stream().filter(sub -> sub.getId().equals(targetSubscriberId)).toList();
+        }
+
+        if (matched.isEmpty()) {
+            envelope.cancel(new NoResponderException(channel));
+            return envelope;
+        }
+
+        envelope.setExpectedResponders(matched.size());
+        envelope.getSingleFuture().orTimeout(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        envelope.getAllFuture().orTimeout(timeout.toMillis(), TimeUnit.MILLISECONDS);
+
+        pendingRequests.add(envelope);
+        CompletableFuture.allOf(envelope.getSingleFuture(), envelope.getAllFuture())
+                .whenComplete((ignored, error) -> pendingRequests.remove(envelope));
+
+        registry.recordPublication(envelope, channel, matched.size());
+        dispatcher.dispatch(envelope, matched);
+
+        return envelope;
+    }
+
+    // === INTROSPECTION & LIFECYCLE ===
+
     @Override
     public EventRegistry getRegistry() {
         return registry;
@@ -286,20 +309,28 @@ public final class DefaultEventBus implements EventBus {
 
     @Override
     public void close() {
-        if (closed.compareAndSet(false, true)) {
-            for (Subscription sub : activeSubscriptions) {
-                try {
-                    sub.unsubscribe();
-                } catch (Throwable ignored) {
-                    // Best-effort cleanup: the subscription is already inactive.
-                }
-            }
-            activeSubscriptions.clear();
+        if (!closed.compareAndSet(false, true)) {
+            return;
+        }
+        IllegalStateException closedCause = new IllegalStateException("EventBus was closed before the request completed.");
+        for (RequestEnvelope<?, ?> envelope : pendingRequests) {
+            envelope.cancel(closedCause);
+        }
+        pendingRequests.clear();
+
+        for (Subscription subscription : List.copyOf(subscriptions.values())) {
             try {
-                dispatcher.close();
-            } catch (Exception e) {
-                throw new RuntimeException("Failed to shut down EventBus dispatcher.", e);
+                subscription.unsubscribe();
+            } catch (Throwable ignored) {
+                // Best-effort cleanup: the subscription is already inactive.
             }
+        }
+        subscriptions.clear();
+
+        try {
+            dispatcher.close();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to shut down EventBus dispatcher.", e);
         }
     }
 }

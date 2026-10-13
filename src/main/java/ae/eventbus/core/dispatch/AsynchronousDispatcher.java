@@ -1,10 +1,8 @@
 package ae.eventbus.core.dispatch;
 
 import java.util.List;
-import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 
 import ae.eventbus.core.dispatch.exceptions.LoggingExceptionHandler;
 import ae.eventbus.core.dispatch.exceptions.SubscriberExceptionHandler;
@@ -13,19 +11,29 @@ import ae.eventbus.core.subscription.Subscriber;
 
 /**
  * Dispatches all subscribers asynchronously via an {@link ExecutorService}.
- * The publishing thread returns immediately without waiting for subscriber execution.
+ *
+ * <p>The publishing thread normally returns immediately. When {@code maxConcurrentTasks}
+ * invocations are already running, further invocations run on the publishing thread
+ * (backpressure). See {@link EventDispatcher#DEFAULT_MAX_CONCURRENT_ASYNC_TASKS}.</p>
  */
 public final class AsynchronousDispatcher implements EventDispatcher {
 
-    private final ExecutorService executorService;
-    private final SubscriberExceptionHandler exceptionHandler;
+    private final SubscriberInvoker invoker;
 
     /**
-     * Creates a dispatcher backed by the supplied executor and exception handler.
+     * Creates a dispatcher backed by the supplied executor.
+     *
+     * @param executorService    runs subscribers; shut down by {@link #close()}
+     * @param exceptionHandler   receives subscriber failures
+     * @param maxConcurrentTasks upper bound on concurrently running invocations
      */
+    public AsynchronousDispatcher(ExecutorService executorService, SubscriberExceptionHandler exceptionHandler, int maxConcurrentTasks) {
+        this.invoker = new SubscriberInvoker(exceptionHandler, executorService, maxConcurrentTasks);
+    }
+
+    /** Creates a dispatcher bounded by {@link EventDispatcher#DEFAULT_MAX_CONCURRENT_ASYNC_TASKS}. */
     public AsynchronousDispatcher(ExecutorService executorService, SubscriberExceptionHandler exceptionHandler) {
-        this.executorService = Objects.requireNonNull(executorService, "ExecutorService must not be null.");
-        this.exceptionHandler = Objects.requireNonNull(exceptionHandler, "ExceptionHandler must not be null.");
+        this(executorService, exceptionHandler, DEFAULT_MAX_CONCURRENT_ASYNC_TASKS);
     }
 
     /** Creates a dispatcher with virtual threads and the supplied exception handler. */
@@ -35,37 +43,19 @@ public final class AsynchronousDispatcher implements EventDispatcher {
 
     /** Creates a dispatcher with virtual threads and the default logging handler. */
     public AsynchronousDispatcher() {
-        this(Executors.newVirtualThreadPerTaskExecutor(), new LoggingExceptionHandler());
+        this(new LoggingExceptionHandler());
     }
 
     @Override
     public void dispatch(Event event, List<Subscriber<?>> subscribers) {
-        if (subscribers == null || subscribers.isEmpty()) {
-            return;
-        }
-
-        for (Subscriber<?> subscriber : subscribers) {
-            executorService.submit(() -> {
-                try {
-                    subscriber.invoke(event);
-                } catch (Throwable t) {
-                    exceptionHandler.handleException(t, subscriber, event);
-                }
-            });
+        if (subscribers != null) {
+            invoker.invokeAll(event, subscribers, true);
         }
     }
 
     /** Graceful shutdown: waits up to 5 seconds for in-flight tasks before forcing termination. */
     @Override
     public void close() {
-        executorService.shutdown();
-        try {
-            if (!executorService.awaitTermination(SynchronousDispatcher.SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                executorService.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            executorService.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
+        invoker.close();
     }
 }

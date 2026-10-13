@@ -3,7 +3,6 @@ package ae.eventbus.core.channel;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.regex.Pattern;
 
@@ -26,6 +25,7 @@ public final class Channel implements Comparable<Channel> {
     public static final String DEFAULT_SEPARATOR = "/";
 
     private final List<String> segments;
+    private final int hash;
 
     /**
      * Lazily cached parent channel to avoid redundant object allocations on repeated calls.
@@ -57,6 +57,7 @@ public final class Channel implements Comparable<Channel> {
         }
         // Defensive copy guarantees immutability
         this.segments = List.copyOf(cleanSegments);
+        this.hash = this.segments.hashCode();
     }
 
     /**
@@ -235,7 +236,7 @@ public final class Channel implements Comparable<Channel> {
 
     @Override
     public int hashCode() {
-        return Objects.hash(segments);
+        return hash;
     }
 
     @Override

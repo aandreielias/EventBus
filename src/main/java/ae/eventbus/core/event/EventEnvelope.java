@@ -75,9 +75,10 @@ public final class EventEnvelope<T> extends AbstractEvent {
         return payload.getClass();
     }
 
+    /** Describes the envelope without the payload itself, so logging an envelope never leaks payload data. */
     @Override
     public String toString() {
-        return String.format("EventEnvelope[id=%s, payloadType=%s, channels=%s, payload=%s]",
-                getId(), payload.getClass().getSimpleName(), getChannels(), payload);
+        return String.format("EventEnvelope[id=%s, payloadType=%s, channels=%s]",
+                getId(), payload.getClass().getSimpleName(), getChannels());
     }
 }

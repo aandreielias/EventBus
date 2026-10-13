@@ -1,10 +1,8 @@
 package ae.eventbus.core.dispatch;
 
 import java.util.List;
-import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 
 import ae.eventbus.core.dispatch.exceptions.LoggingExceptionHandler;
 import ae.eventbus.core.dispatch.exceptions.SubscriberExceptionHandler;
@@ -14,63 +12,50 @@ import ae.eventbus.core.subscription.Subscriber;
 
 /**
  * Dispatches synchronous subscribers on the caller's thread and offloads
- * {@link DispatchMode#ASYNCHRONOUS} subscribers to a virtual-thread executor.
+ * {@link DispatchMode#ASYNCHRONOUS} subscribers to an executor (virtual threads by default).
+ *
+ * <p>At most {@code maxConcurrentAsyncTasks} async invocations run at once; beyond that they run
+ * on the publishing thread. See {@link EventDispatcher#DEFAULT_MAX_CONCURRENT_ASYNC_TASKS}.</p>
  */
 public final class SynchronousDispatcher implements EventDispatcher {
 
-    static final int SHUTDOWN_TIMEOUT_SECONDS = 5;
+    private final SubscriberInvoker invoker;
 
-    private final SubscriberExceptionHandler exceptionHandler;
-    private final ExecutorService asyncExecutor;
-
-    public SynchronousDispatcher(SubscriberExceptionHandler exceptionHandler, ExecutorService asyncExecutor) {
-        this.exceptionHandler = Objects.requireNonNull(exceptionHandler, "ExceptionHandler must not be null.");
-        this.asyncExecutor = Objects.requireNonNull(asyncExecutor, "AsyncExecutor must not be null.");
+    /**
+     * Creates a dispatcher whose async subscribers run on the supplied executor.
+     *
+     * @param exceptionHandler        receives subscriber failures
+     * @param asyncExecutor           runs async subscribers; shut down by {@link #close()}
+     * @param maxConcurrentAsyncTasks upper bound on concurrently running async invocations
+     */
+    public SynchronousDispatcher(SubscriberExceptionHandler exceptionHandler, ExecutorService asyncExecutor, int maxConcurrentAsyncTasks) {
+        this.invoker = new SubscriberInvoker(exceptionHandler, asyncExecutor, maxConcurrentAsyncTasks);
     }
 
+    /** Creates a dispatcher bounded by {@link EventDispatcher#DEFAULT_MAX_CONCURRENT_ASYNC_TASKS}. */
+    public SynchronousDispatcher(SubscriberExceptionHandler exceptionHandler, ExecutorService asyncExecutor) {
+        this(exceptionHandler, asyncExecutor, DEFAULT_MAX_CONCURRENT_ASYNC_TASKS);
+    }
+
+    /** Creates a dispatcher using virtual threads for async subscribers. */
     public SynchronousDispatcher(SubscriberExceptionHandler exceptionHandler) {
         this(exceptionHandler, Executors.newVirtualThreadPerTaskExecutor());
     }
 
+    /** Creates a dispatcher using virtual threads and the default logging exception handler. */
     public SynchronousDispatcher() {
         this(new LoggingExceptionHandler());
     }
 
     @Override
     public void dispatch(Event event, List<Subscriber<?>> subscribers) {
-        if (subscribers == null || subscribers.isEmpty()) {
-            return;
-        }
-
-        for (Subscriber<?> subscriber : subscribers) {
-            if (subscriber.getDispatchMode() == DispatchMode.ASYNCHRONOUS) {
-                asyncExecutor.submit(() -> {
-                    try {
-                        subscriber.invoke(event);
-                    } catch (Throwable t) {
-                        exceptionHandler.handleException(t, subscriber, event);
-                    }
-                });
-            } else {
-                try {
-                    subscriber.invoke(event);
-                } catch (Throwable t) {
-                    exceptionHandler.handleException(t, subscriber, event);
-                }
-            }
+        if (subscribers != null) {
+            invoker.invokeAll(event, subscribers, false);
         }
     }
 
     @Override
     public void close() {
-        asyncExecutor.shutdown();
-        try {
-            if (!asyncExecutor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                asyncExecutor.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            asyncExecutor.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
+        invoker.close();
     }
 }

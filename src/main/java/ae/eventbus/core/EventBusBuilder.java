@@ -14,7 +14,6 @@ import ae.eventbus.core.routing.ExactMatchRouter;
 import ae.eventbus.core.routing.EventRouter;
 import ae.eventbus.core.routing.HierarchicalRouter;
 import ae.eventbus.core.subscription.EventHandler;
-import ae.eventbus.core.subscription.ReferenceType;
 import ae.eventbus.core.validation.DefaultEventValidator;
 import ae.eventbus.core.validation.EventValidator;
 import ae.eventbus.core.validation.NoOpValidator;
@@ -24,6 +23,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Fluent builder for creating fully configured {@link EventBus} instances.
@@ -36,9 +36,14 @@ import java.util.concurrent.ExecutorService;
  *   <li>Registry: {@link DefaultEventRegistry} (history: 1 000, channels: 10 000)</li>
  *   <li>Separator: {@code "/"}</li>
  *   <li>Default request timeout: 5 seconds</li>
+ *   <li>Max concurrent async invocations: {@value EventDispatcher#DEFAULT_MAX_CONCURRENT_ASYNC_TASKS}</li>
  * </ul>
  *
- * <h3>Incompatible combinations (detected at {@link #build()} time):</h3>
+ * <p>A builder may be reused: every {@link #build()} call creates fresh router, dispatcher and
+ * registry instances (custom instances passed to {@code withRouter}/{@code withDispatcher} are
+ * the caller's responsibility and would be shared).</p>
+ *
+ * <h2>Incompatible combinations (detected at {@link #build()} time)</h2>
  * <ul>
  *   <li>{@link #withNoOpRegistry()} + {@link #withMaxHistorySize(int)}</li>
  *   <li>{@link #withDispatcher(EventDispatcher)} + {@link #withAsynchronousDispatching()}</li>
@@ -46,16 +51,16 @@ import java.util.concurrent.ExecutorService;
  */
 public final class EventBusBuilder {
 
-    private EventRouter router;
+    private EventRouter customRouter;
+    private boolean exactRouting = false;
     private EventDispatcher customDispatcher;
     private SubscriberExceptionHandler exceptionHandler;
-    private EventRegistry registry;
     private EventValidator validator;
     private String channelSeparator = Channel.DEFAULT_SEPARATOR;
-    private ReferenceType defaultReferenceType = ReferenceType.STRONG;
     private Duration defaultRequestTimeout = Duration.ofSeconds(5);
     private int maxHistorySize = DefaultEventRegistry.DEFAULT_MAX_HISTORY_SIZE;
     private int maxChannels = DefaultEventRegistry.DEFAULT_MAX_CHANNELS;
+    private int maxConcurrentAsyncTasks = EventDispatcher.DEFAULT_MAX_CONCURRENT_ASYNC_TASKS;
     private boolean disableRegistry = false;
     private boolean maxHistorySizeExplicitlySet = false;
     private boolean asyncDispatching = false;
@@ -69,19 +74,21 @@ public final class EventBusBuilder {
 
     /** Uses {@link ExactMatchRouter} — O(1) lookup, no parent-channel inheritance. */
     public EventBusBuilder withExactRouting() {
-        this.router = new ExactMatchRouter();
+        this.customRouter = null;
+        this.exactRouting = true;
         return this;
     }
 
     /** Uses {@link HierarchicalRouter} — subscribers on parent channels receive child-channel events. */
     public EventBusBuilder withHierarchicalRouting() {
-        this.router = new HierarchicalRouter();
+        this.customRouter = null;
+        this.exactRouting = false;
         return this;
     }
 
     /** Supplies a fully custom router implementation. */
     public EventBusBuilder withRouter(EventRouter router) {
-        this.router = Objects.requireNonNull(router, "Custom router must not be null.");
+        this.customRouter = Objects.requireNonNull(router, "Custom router must not be null.");
         return this;
     }
 
@@ -110,7 +117,10 @@ public final class EventBusBuilder {
         return this;
     }
 
-    /** All subscribers execute on the supplied executor; the publisher returns immediately. */
+    /**
+     * All subscribers execute on the supplied executor; the publisher returns immediately.
+     * The bus takes ownership of the executor and shuts it down on {@link EventBus#close()}.
+     */
     public EventBusBuilder withAsynchronousDispatching(ExecutorService executorService) {
         this.customDispatcher = null;
         this.asyncDispatching = true;
@@ -154,9 +164,17 @@ public final class EventBusBuilder {
         return this;
     }
 
-    /** Sets the default reference type for subscriptions that do not specify one (default: {@link ReferenceType#STRONG}). */
-    public EventBusBuilder withDefaultReferenceType(ReferenceType referenceType) {
-        this.defaultReferenceType = Objects.requireNonNull(referenceType, "ReferenceType must not be null.");
+    /**
+     * Caps how many asynchronous subscriber invocations may run at once (default:
+     * {@value EventDispatcher#DEFAULT_MAX_CONCURRENT_ASYNC_TASKS}). When the cap is reached, further
+     * invocations run on the publishing thread, which throttles publishers instead of queueing
+     * unbounded work. Ignored when a custom dispatcher is supplied.
+     */
+    public EventBusBuilder withMaxConcurrentAsyncTasks(int maxConcurrentAsyncTasks) {
+        if (maxConcurrentAsyncTasks <= 0) {
+            throw new IllegalArgumentException("Max concurrent async tasks must be greater than zero.");
+        }
+        this.maxConcurrentAsyncTasks = maxConcurrentAsyncTasks;
         return this;
     }
 
@@ -190,8 +208,8 @@ public final class EventBusBuilder {
 
     /**
      * Registers a dead-letter handler invoked whenever an event is published to a channel
-     * with no active subscribers. Exceptions thrown by the handler are silently swallowed
-     * so they never propagate to the publisher.
+     * with no matching subscribers. Exceptions thrown by the handler are logged and never
+     * propagate to the publisher.
      */
     public EventBusBuilder withDeadLetterHandler(EventHandler<Event> handler) {
         this.deadLetterHandler = Objects.requireNonNull(handler, "Dead-letter handler must not be null.");
@@ -224,33 +242,30 @@ public final class EventBusBuilder {
                     "use withDispatcher() alone, or remove it and use withAsynchronousDispatching().");
         }
 
-        if (router == null) router = new HierarchicalRouter();
-        if (exceptionHandler == null) exceptionHandler = new LoggingExceptionHandler();
+        EventRouter router = customRouter != null ? customRouter
+                : exactRouting ? new ExactMatchRouter() : new HierarchicalRouter();
+        SubscriberExceptionHandler handler = exceptionHandler != null ? exceptionHandler : new LoggingExceptionHandler();
 
-        EventDispatcher dispatcher = this.customDispatcher;
+        EventDispatcher dispatcher = customDispatcher;
         if (dispatcher == null) {
             if (asyncDispatching) {
-                dispatcher = customExecutor != null
-                        ? new AsynchronousDispatcher(customExecutor, exceptionHandler)
-                        : new AsynchronousDispatcher(exceptionHandler);
+                ExecutorService executor = customExecutor != null ? customExecutor : Executors.newVirtualThreadPerTaskExecutor();
+                dispatcher = new AsynchronousDispatcher(executor, handler, maxConcurrentAsyncTasks);
             } else {
-                dispatcher = new SynchronousDispatcher(exceptionHandler);
+                dispatcher = new SynchronousDispatcher(handler, Executors.newVirtualThreadPerTaskExecutor(), maxConcurrentAsyncTasks);
             }
         }
 
-        if (validator == null) validator = new DefaultEventValidator();
-
-        if (registry == null) {
-            registry = disableRegistry
-                    ? new NoOpEventRegistry()
-                    : new DefaultEventRegistry(router, maxHistorySize, maxChannels);
-        }
-
+        EventValidator effectiveValidator = validator != null ? validator
+                : new DefaultEventValidator(DefaultEventValidator.DEFAULT_MAX_CHANNEL_DEPTH, channelSeparator);
+        EventRegistry registry = disableRegistry
+                ? new NoOpEventRegistry()
+                : new DefaultEventRegistry(router, maxHistorySize, maxChannels);
         for (Channel ch : preRegisteredChannels) {
             registry.registerChannel(ch);
         }
 
-        return new DefaultEventBus(router, dispatcher, registry, validator, channelSeparator,
-                defaultReferenceType, defaultRequestTimeout, deadLetterHandler);
+        return new DefaultEventBus(router, dispatcher, registry, effectiveValidator, channelSeparator,
+                defaultRequestTimeout, deadLetterHandler);
     }
 }

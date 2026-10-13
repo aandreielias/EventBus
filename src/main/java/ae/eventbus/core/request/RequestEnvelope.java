@@ -12,13 +12,14 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Special event carrying a request payload and managing completion promises.
  * Supports:
  * <ul>
- *   <li>Single-responder (first Response wins)</li>
- *   <li>Multi-responder </li>
+ *   <li>Single-responder: the first successful response wins; the request fails only if every responder fails</li>
+ *   <li>Multi-responder: all successful responses; fails only if every responder fails</li>
  *   <li>Targeted requests (addressed to a specific subscriber)</li>
  * </ul>
  *
@@ -38,6 +39,7 @@ public final class RequestEnvelope<REQ, RES> extends AbstractEvent {
     private final CompletableFuture<List<RES>> allFuture = new CompletableFuture<>();
     private final List<RES> collectedResponses = new CopyOnWriteArrayList<>();
     private final AtomicInteger remainingResponders = new AtomicInteger(0);
+    private final AtomicReference<Throwable> firstFailure = new AtomicReference<>();
 
     /**
      * Constructs a broadcast request (any or all subscribers on the channel may answer).
@@ -84,22 +86,52 @@ public final class RequestEnvelope<REQ, RES> extends AbstractEvent {
         remainingResponders.set(count);
     }
 
+    /**
+     * Records a successful response from one responder.
+     * A non-null response that is not an instance of {@link #getResponseType()} is recorded
+     * as a {@link ClassCastException} failure instead, so callers never receive a mistyped value.
+     */
     public void submitResponse(RES response) {
-        singleFuture.complete(response);
+        if (response != null && !responseType.isInstance(response)) {
+            submitFailure(new ClassCastException(String.format(
+                    "Request handler on channel '%s' returned %s, but the requester expects %s.",
+                    getPrimaryChannel(), response.getClass().getName(), responseType.getName())));
+            return;
+        }
         collectedResponses.add(response);
-        if (remainingResponders.decrementAndGet() <= 0) {
+        singleFuture.complete(response);
+        responderFinished();
+    }
+
+    /** Records a failure from one responder. Other responders may still answer successfully. */
+    public void submitFailure(Throwable throwable) {
+        firstFailure.compareAndSet(null, throwable);
+        responderFinished();
+    }
+
+    /** Completes the futures once the last responder has answered or failed. */
+    private void responderFinished() {
+        if (remainingResponders.decrementAndGet() > 0) {
+            return;
+        }
+        if (collectedResponses.isEmpty()) {
+            cancel(firstFailure.get());
+        } else {
             allFuture.complete(Collections.unmodifiableList(new ArrayList<>(collectedResponses)));
         }
     }
 
-    public void submitFailure(Throwable throwable) {
-        singleFuture.completeExceptionally(throwable);
-        if (remainingResponders.decrementAndGet() <= 0) {
-            if (collectedResponses.isEmpty()) {
-                allFuture.completeExceptionally(throwable);
-            } else {
-                allFuture.complete(Collections.unmodifiableList(new ArrayList<>(collectedResponses)));
-            }
-        }
+    /**
+     * Fails both futures immediately, regardless of outstanding responders.
+     * Used when the bus shuts down while the request is still pending.
+     */
+    public void cancel(Throwable cause) {
+        singleFuture.completeExceptionally(cause);
+        allFuture.completeExceptionally(cause);
+    }
+
+    /** Returns {@code true} once both the single and the scatter-gather futures are complete. */
+    public boolean isDone() {
+        return singleFuture.isDone() && allFuture.isDone();
     }
 }
