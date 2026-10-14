@@ -1,6 +1,7 @@
 package ae.eventbus.core;
 
 import ae.eventbus.core.channel.Channel;
+import ae.eventbus.core.dispatch.EventDispatcher;
 import ae.eventbus.core.request.NoResponderException;
 import ae.eventbus.core.subscription.Subscription;
 import org.junit.jupiter.api.Test;
@@ -10,6 +11,8 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -118,6 +121,44 @@ class RequestResponseTest {
             assertThatThrownBy(future::get)
                     .isInstanceOf(ExecutionException.class)
                     .hasCauseInstanceOf(NoResponderException.class);
+        }
+    }
+
+    @Test
+    void testHandlerIsSkippedWhenRequestTimedOutBeforeDispatch() throws Exception {
+        // Dispatcher that delivers late, after the request has already timed out.
+        CompletableFuture<Void> delivered = new CompletableFuture<>();
+        EventDispatcher lateDispatcher = (event, subscribers) -> Thread.ofVirtual().start(() -> {
+            try {
+                Thread.sleep(200);
+                for (var sub : subscribers) {
+                    sub.invoke(event);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (Exception ignored) {
+                // Failures are irrelevant here; the test only checks whether the handler ran.
+            } finally {
+                delivered.complete(null);
+            }
+        });
+
+        try (EventBus bus = EventBusBuilder.create().withDispatcher(lateDispatcher).build()) {
+            Channel channel = Channel.of("rpc", "late");
+            AtomicBoolean handlerRan = new AtomicBoolean(false);
+            bus.handleRequest(channel, PingRequest.class, req -> {
+                handlerRan.set(true);
+                return new PongResponse("too late");
+            });
+
+            CompletableFuture<PongResponse> future =
+                    bus.request(channel, new PingRequest("x"), PongResponse.class, Duration.ofMillis(50));
+
+            assertThatThrownBy(() -> future.get(2, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class)
+                    .hasCauseInstanceOf(TimeoutException.class);
+            delivered.get(2, TimeUnit.SECONDS);
+            assertThat(handlerRan).isFalse();
         }
     }
 }

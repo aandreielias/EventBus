@@ -220,6 +220,10 @@ public final class DefaultEventBus implements EventBus {
         validator.validateChannel(channel);
 
         EventHandler<RequestEnvelope> envelopeHandler = envelope -> {
+            // Timed out or cancelled before delivery: nobody waits for the answer, so skip side effects.
+            if (envelope.isDone()) {
+                return;
+            }
             try {
                 envelope.submitResponse(handler.handle(requestType.cast(envelope.getRequest())));
             } catch (Throwable t) {
